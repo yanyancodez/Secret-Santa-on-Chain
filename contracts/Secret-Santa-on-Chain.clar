@@ -9,6 +9,8 @@
 (define-constant ERR_GIFT_ALREADY_SENT (err u108))
 (define-constant ERR_NOT_YOUR_RECIPIENT (err u109))
 (define-constant ERR_GAME_ALREADY_ENDED (err u110))
+(define-constant ERR_WISHLIST_FULL (err u111))
+(define-constant ERR_WISHLIST_ITEM_NOT_FOUND (err u112))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var game-active bool false)
@@ -36,6 +38,14 @@
     message: (string-ascii 280),
     revealed: bool,
     sent-at: uint
+})
+
+(define-map wishlists principal (list 5 (string-ascii 100)))
+
+(define-map wishlist-preferences principal {
+    min-price-range: uint,
+    max-price-range: uint,
+    special-notes: (string-ascii 200)
 })
 
 (define-public (initialize-game (reg-deadline uint) (reveal-deadline-param uint) (min-amount uint))
@@ -264,4 +274,110 @@
 
 (define-read-only (get-contract-balance)
     (stx-get-balance (as-contract tx-sender))
+)
+
+(define-public (create-wishlist (items (list 5 (string-ascii 100))) (min-price uint) (max-price uint) (notes (string-ascii 200)))
+    (let 
+        (
+            (participant tx-sender)
+        )
+        (asserts! (is-registered participant) ERR_NOT_REGISTERED)
+        (asserts! (<= min-price max-price) ERR_UNAUTHORIZED)
+        (asserts! (<= (len items) u5) ERR_WISHLIST_FULL)
+        (map-set wishlists participant items)
+        (map-set wishlist-preferences participant {
+            min-price-range: min-price,
+            max-price-range: max-price,
+            special-notes: notes
+        })
+        (ok true)
+    )
+)
+
+(define-public (add-wishlist-item (new-item (string-ascii 100)))
+    (let 
+        (
+            (participant tx-sender)
+            (current-wishlist (default-to (list) (map-get? wishlists participant)))
+        )
+        (asserts! (is-registered participant) ERR_NOT_REGISTERED)
+        (asserts! (< (len current-wishlist) u5) ERR_WISHLIST_FULL)
+        (map-set wishlists participant (unwrap! (as-max-len? (append current-wishlist new-item) u5) ERR_WISHLIST_FULL))
+        (ok true)
+    )
+)
+
+(define-public (remove-wishlist-item (item-index uint))
+    (let 
+        (
+            (participant tx-sender)
+            (current-wishlist (default-to (list) (map-get? wishlists participant)))
+            (wishlist-length (len current-wishlist))
+        )
+        (asserts! (is-registered participant) ERR_NOT_REGISTERED)
+        (asserts! (< item-index wishlist-length) ERR_WISHLIST_ITEM_NOT_FOUND)
+        (map-set wishlists participant 
+            (unwrap! (as-max-len? 
+                (concat 
+                    (unwrap! (slice? current-wishlist u0 item-index) ERR_WISHLIST_ITEM_NOT_FOUND)
+                    (unwrap! (slice? current-wishlist (+ item-index u1) wishlist-length) ERR_WISHLIST_ITEM_NOT_FOUND)
+                ) 
+                u5) 
+            ERR_WISHLIST_ITEM_NOT_FOUND)
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-wishlist-preferences (min-price uint) (max-price uint) (notes (string-ascii 200)))
+    (let 
+        (
+            (participant tx-sender)
+        )
+        (asserts! (is-registered participant) ERR_NOT_REGISTERED)
+        (asserts! (<= min-price max-price) ERR_UNAUTHORIZED)
+        (map-set wishlist-preferences participant {
+            min-price-range: min-price,
+            max-price-range: max-price,
+            special-notes: notes
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-recipient-wishlist (recipient principal))
+    (let 
+        (
+            (sender tx-sender)
+            (sender-data (map-get? participants sender))
+        )
+        (match sender-data
+            participant-info
+                (if (is-eq (some recipient) (get recipient participant-info))
+                    {
+                        wishlist: (map-get? wishlists recipient),
+                        preferences: (map-get? wishlist-preferences recipient)
+                    }
+                    {
+                        wishlist: none,
+                        preferences: none
+                    }
+                )
+            {
+                wishlist: none,
+                preferences: none
+            }
+        )
+    )
+)
+
+(define-read-only (get-my-wishlist)
+    {
+        wishlist: (map-get? wishlists tx-sender),
+        preferences: (map-get? wishlist-preferences tx-sender)
+    }
+)
+
+(define-read-only (has-wishlist (participant principal))
+    (is-some (map-get? wishlists participant))
 )

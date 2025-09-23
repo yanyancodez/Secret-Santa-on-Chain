@@ -11,6 +11,11 @@
 (define-constant ERR_GAME_ALREADY_ENDED (err u110))
 (define-constant ERR_WISHLIST_FULL (err u111))
 (define-constant ERR_WISHLIST_ITEM_NOT_FOUND (err u112))
+(define-constant ERR_ALREADY_RATED (err u113))
+(define-constant ERR_INVALID_RATING (err u114))
+(define-constant ERR_CANNOT_RATE_SELF (err u115))
+(define-constant ERR_GIFT_NOT_REVEALED (err u116))
+(define-constant ERR_RATING_PERIOD_EXPIRED (err u117))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var game-active bool false)
@@ -21,6 +26,9 @@
 (define-data-var registration-deadline uint u0)
 (define-data-var reveal-deadline uint u0)
 (define-data-var game-round uint u0)
+(define-data-var rating-period-blocks uint u144)
+(define-data-var min-reputation-score int 0)
+(define-data-var reputation-threshold int 50)
 
 (define-map participants principal {
     registered: bool,
@@ -46,6 +54,46 @@
     min-price-range: uint,
     max-price-range: uint,
     special-notes: (string-ascii 200)
+})
+
+(define-map gift-ratings { recipient: principal, round: uint } {
+    rating: uint,
+    feedback: (string-ascii 500),
+    rated-at: uint,
+    gift-value-rating: uint,
+    creativity-rating: uint,
+    timeliness-rating: uint
+})
+
+(define-map participant-reputation principal {
+    total-score: int,
+    games-participated: uint,
+    total-ratings-received: uint,
+    average-rating: uint,
+    five-star-count: uint,
+    one-star-count: uint,
+    last-game-round: uint
+})
+
+(define-map round-performance { participant: principal, round: uint } {
+    gift-sent-on-time: bool,
+    gift-rating-received: uint,
+    feedback-received: (optional (string-ascii 500)),
+    bonus-points: int
+})
+
+(define-map reputation-badges principal {
+    super-santa: bool,
+    consistent-giver: bool,
+    creative-genius: bool,
+    punctual-elf: bool,
+    earned-at: uint
+})
+
+(define-map feedback-history { sender: principal, recipient: principal, round: uint } {
+    feedback: (string-ascii 500),
+    anonymous: bool,
+    timestamp: uint
 })
 
 (define-public (initialize-game (reg-deadline uint) (reveal-deadline-param uint) (min-amount uint))
@@ -380,4 +428,249 @@
 
 (define-read-only (has-wishlist (participant principal))
     (is-some (map-get? wishlists participant))
+)
+
+(define-public (rate-gift 
+    (overall-rating uint) 
+    (value-rating uint)
+    (creativity-rating uint)
+    (timeliness-rating uint)
+    (feedback (string-ascii 500)))
+    (let 
+        (
+            (recipient tx-sender)
+            (current-round (var-get game-round))
+            (gift-data (unwrap! (map-get? gifts recipient) ERR_NOT_REGISTERED))
+            (rating-key { recipient: recipient, round: current-round })
+        )
+        (asserts! (get revealed gift-data) ERR_GIFT_NOT_REVEALED)
+        (asserts! (is-none (map-get? gift-ratings rating-key)) ERR_ALREADY_RATED)
+        (asserts! (and (>= overall-rating u1) (<= overall-rating u5)) ERR_INVALID_RATING)
+        (asserts! (and (>= value-rating u1) (<= value-rating u5)) ERR_INVALID_RATING)
+        (asserts! (and (>= creativity-rating u1) (<= creativity-rating u5)) ERR_INVALID_RATING)
+        (asserts! (and (>= timeliness-rating u1) (<= timeliness-rating u5)) ERR_INVALID_RATING)
+        (asserts! (<= stacks-block-height (+ (var-get reveal-deadline) (var-get rating-period-blocks))) ERR_RATING_PERIOD_EXPIRED)
+        
+        (map-set gift-ratings rating-key {
+            rating: overall-rating,
+            feedback: feedback,
+            rated-at: stacks-block-height,
+            gift-value-rating: value-rating,
+            creativity-rating: creativity-rating,
+            timeliness-rating: timeliness-rating
+        })
+        
+        (let 
+            (
+                (sender (get sender gift-data))
+                (sender-reputation (default-to 
+                    {
+                        total-score: 0,
+                        games-participated: u0,
+                        total-ratings-received: u0,
+                        average-rating: u0,
+                        five-star-count: u0,
+                        one-star-count: u0,
+                        last-game-round: u0
+                    }
+                    (map-get? participant-reputation sender)))
+                (new-total-ratings (+ (get total-ratings-received sender-reputation) u1))
+                (rating-points (calculate-rating-points overall-rating))
+                (new-total-score (+ (get total-score sender-reputation) rating-points))
+                (new-avg (/ (+ (* (get average-rating sender-reputation) (get total-ratings-received sender-reputation)) overall-rating) new-total-ratings))
+            )
+            
+            (map-set participant-reputation sender {
+                total-score: new-total-score,
+                games-participated: (if (is-eq (get last-game-round sender-reputation) current-round) 
+                    (get games-participated sender-reputation)
+                    (+ (get games-participated sender-reputation) u1)),
+                total-ratings-received: new-total-ratings,
+                average-rating: new-avg,
+                five-star-count: (if (is-eq overall-rating u5) 
+                    (+ (get five-star-count sender-reputation) u1) 
+                    (get five-star-count sender-reputation)),
+                one-star-count: (if (is-eq overall-rating u1) 
+                    (+ (get one-star-count sender-reputation) u1) 
+                    (get one-star-count sender-reputation)),
+                last-game-round: current-round
+            })
+            
+            (map-set round-performance { participant: sender, round: current-round } {
+                gift-sent-on-time: true,
+                gift-rating-received: overall-rating,
+                feedback-received: (some feedback),
+                bonus-points: rating-points
+            })
+            
+            (map-set feedback-history { sender: sender, recipient: recipient, round: current-round } {
+                feedback: feedback,
+                anonymous: true,
+                timestamp: stacks-block-height
+            })
+            
+            (unwrap-panic (check-and-award-badges sender))
+        )
+        
+        (ok true)
+    )
+)
+
+(define-private (calculate-rating-points (rating uint))
+    (if (is-eq rating u5)
+        10
+        (if (is-eq rating u4)
+            5
+            (if (is-eq rating u3)
+                0
+                (if (is-eq rating u2)
+                    -5
+                    -10
+                )
+            )
+        )
+    )
+)
+
+(define-private (check-and-award-badges (participant principal))
+    (match (map-get? participant-reputation participant)
+        reputation
+            (let 
+                (
+                    (current-badges (default-to 
+                        {
+                            super-santa: false,
+                            consistent-giver: false,
+                            creative-genius: false,
+                            punctual-elf: false,
+                            earned-at: u0
+                        }
+                        (map-get? reputation-badges participant)))
+                )
+                (map-set reputation-badges participant {
+                    super-santa: (or (get super-santa current-badges) (>= (get total-score reputation) 100)),
+                    consistent-giver: (or (get consistent-giver current-badges) (and (>= (get games-participated reputation) u5) (>= (get average-rating reputation) u4))),
+                    creative-genius: (or (get creative-genius current-badges) (>= (get five-star-count reputation) u10)),
+                    punctual-elf: (or (get punctual-elf current-badges) (>= (get games-participated reputation) u3)),
+                    earned-at: stacks-block-height
+                })
+                (ok true)
+            )
+        (err ERR_NOT_REGISTERED)
+    )
+)
+
+(define-public (provide-anonymous-feedback (recipient principal) (feedback (string-ascii 500)))
+    (let 
+        (
+            (sender tx-sender)
+            (current-round (var-get game-round))
+            (sender-data (unwrap! (map-get? participants sender) ERR_NOT_REGISTERED))
+        )
+        (asserts! (is-eq (some recipient) (get recipient sender-data)) ERR_NOT_YOUR_RECIPIENT)
+        (asserts! (get gift-sent sender-data) ERR_GIFT_NOT_REVEALED)
+        
+        (map-set feedback-history { sender: sender, recipient: recipient, round: current-round } {
+            feedback: feedback,
+            anonymous: true,
+            timestamp: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-public (set-reputation-threshold (new-threshold int))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        (var-set reputation-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-public (set-rating-period (new-period uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        (asserts! (> new-period u0) ERR_UNAUTHORIZED)
+        (var-set rating-period-blocks new-period)
+        (ok true)
+    )
+)
+
+(define-read-only (get-participant-reputation (participant principal))
+    (default-to 
+        {
+            total-score: 0,
+            games-participated: u0,
+            total-ratings-received: u0,
+            average-rating: u0,
+            five-star-count: u0,
+            one-star-count: u0,
+            last-game-round: u0
+        }
+        (map-get? participant-reputation participant)
+    )
+)
+
+(define-read-only (get-gift-rating (recipient principal) (round uint))
+    (map-get? gift-ratings { recipient: recipient, round: round })
+)
+
+(define-read-only (get-round-performance (participant principal) (round uint))
+    (map-get? round-performance { participant: participant, round: round })
+)
+
+(define-read-only (get-participant-badges (participant principal))
+    (default-to 
+        {
+            super-santa: false,
+            consistent-giver: false,
+            creative-genius: false,
+            punctual-elf: false,
+            earned-at: u0
+        }
+        (map-get? reputation-badges participant)
+    )
+)
+
+(define-read-only (get-feedback-for-round (sender principal) (recipient principal) (round uint))
+    (map-get? feedback-history { sender: sender, recipient: recipient, round: round })
+)
+
+(define-read-only (is-eligible-for-premium-game (participant principal))
+    (let 
+        (
+            (reputation (get-participant-reputation participant))
+        )
+        (>= (get total-score reputation) (var-get reputation-threshold))
+    )
+)
+
+(define-read-only (get-reputation-stats)
+    {
+        threshold: (var-get reputation-threshold),
+        rating-period: (var-get rating-period-blocks),
+        current-round: (var-get game-round)
+    }
+)
+
+(define-read-only (calculate-reputation-percentile (participant principal))
+    (let 
+        (
+            (reputation (get-participant-reputation participant))
+            (score (get total-score reputation))
+        )
+        (if (> score 80)
+            u95
+            (if (> score 50)
+                u75
+                (if (> score 20)
+                    u50
+                    (if (> score 0)
+                        u25
+                        u0
+                    )
+                )
+            )
+        )
+    )
 )

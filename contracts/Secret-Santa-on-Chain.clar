@@ -16,6 +16,10 @@
 (define-constant ERR_CANNOT_RATE_SELF (err u115))
 (define-constant ERR_GIFT_NOT_REVEALED (err u116))
 (define-constant ERR_RATING_PERIOD_EXPIRED (err u117))
+(define-constant ERR_POOL_NOT_ACTIVE (err u118))
+(define-constant ERR_POOL_DISTRIBUTION_NOT_READY (err u119))
+(define-constant ERR_ALREADY_CLAIMED_BONUS (err u120))
+(define-constant ERR_NO_BONUS_AVAILABLE (err u121))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var game-active bool false)
@@ -29,6 +33,9 @@
 (define-data-var rating-period-blocks uint u144)
 (define-data-var min-reputation-score int 0)
 (define-data-var reputation-threshold int 50)
+(define-data-var matching-pool-enabled bool false)
+(define-data-var matching-pool-total uint u0)
+(define-data-var pool-distribution-complete bool false)
 
 (define-map participants principal {
     registered: bool,
@@ -96,6 +103,17 @@
     timestamp: uint
 })
 
+(define-map pool-contributions { participant: principal, round: uint } {
+    amount: uint,
+    contributed-at: uint
+})
+
+(define-map pool-bonuses { participant: principal, round: uint } {
+    bonus-amount: uint,
+    claimed: bool,
+    earned-at: uint
+})
+
 (define-public (initialize-game (reg-deadline uint) (reveal-deadline-param uint) (min-amount uint))
     (begin
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
@@ -110,6 +128,8 @@
         (var-set registration-deadline reg-deadline)
         (var-set reveal-deadline reveal-deadline-param)
         (var-set game-round (+ (var-get game-round) u1))
+        (var-set matching-pool-total u0)
+        (var-set pool-distribution-complete false)
         (ok true)
     )
 )
@@ -673,4 +693,117 @@
             )
         )
     )
+)
+
+(define-public (enable-matching-pool (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        (var-set matching-pool-enabled enabled)
+        (ok true)
+    )
+)
+
+(define-public (contribute-to-pool (amount uint))
+    (let 
+        (
+            (contributor tx-sender)
+            (current-round (var-get game-round))
+        )
+        (asserts! (var-get game-active) ERR_GAME_NOT_ACTIVE)
+        (asserts! (var-get matching-pool-enabled) ERR_POOL_NOT_ACTIVE)
+        (asserts! (> amount u0) ERR_INSUFFICIENT_FUNDS)
+        (try! (stx-transfer? amount contributor (as-contract tx-sender)))
+        (map-set pool-contributions { participant: contributor, round: current-round } {
+            amount: amount,
+            contributed-at: stacks-block-height
+        })
+        (var-set matching-pool-total (+ (var-get matching-pool-total) amount))
+        (ok true)
+    )
+)
+
+(define-public (distribute-pool-bonuses)
+    (let 
+        (
+            (current-round (var-get game-round))
+            (pool-total (var-get matching-pool-total))
+        )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        (asserts! (var-get matching-pool-enabled) ERR_POOL_NOT_ACTIVE)
+        (asserts! (not (var-get pool-distribution-complete)) ERR_ALREADY_PAIRED)
+        (asserts! (> stacks-block-height (+ (var-get reveal-deadline) (var-get rating-period-blocks))) ERR_POOL_DISTRIBUTION_NOT_READY)
+        (asserts! (> pool-total u0) ERR_INSUFFICIENT_FUNDS)
+        (try! (fold allocate-bonus (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19) (ok u0)))
+        (var-set pool-distribution-complete true)
+        (ok true)
+    )
+)
+
+(define-private (allocate-bonus (index uint) (prev-result (response uint uint)))
+    (if (and (is-ok prev-result) (< index (var-get total-participants)))
+        (let 
+            (
+                (participant (unwrap! (map-get? participant-list index) ERR_NOT_REGISTERED))
+                (current-round (var-get game-round))
+                (rating-data (map-get? gift-ratings { recipient: participant, round: current-round }))
+            )
+            (match rating-data
+                rating
+                    (if (>= (get rating rating) u4)
+                        (let 
+                            (
+                                (pool-total (var-get matching-pool-total))
+                                (total-parts (var-get total-participants))
+                                (bonus-share (/ pool-total total-parts))
+                            )
+                            (map-set pool-bonuses { participant: participant, round: current-round } {
+                                bonus-amount: bonus-share,
+                                claimed: false,
+                                earned-at: stacks-block-height
+                            })
+                            (ok (+ index u1))
+                        )
+                        (ok (+ index u1))
+                    )
+                (ok (+ index u1))
+            )
+        )
+        prev-result
+    )
+)
+
+(define-public (claim-pool-bonus)
+    (let 
+        (
+            (claimer tx-sender)
+            (current-round (var-get game-round))
+            (bonus-key { participant: claimer, round: current-round })
+            (bonus-data (unwrap! (map-get? pool-bonuses bonus-key) ERR_NO_BONUS_AVAILABLE))
+        )
+        (asserts! (var-get pool-distribution-complete) ERR_POOL_DISTRIBUTION_NOT_READY)
+        (asserts! (not (get claimed bonus-data)) ERR_ALREADY_CLAIMED_BONUS)
+        (asserts! (> (get bonus-amount bonus-data) u0) ERR_NO_BONUS_AVAILABLE)
+        (try! (as-contract (stx-transfer? (get bonus-amount bonus-data) tx-sender claimer)))
+        (map-set pool-bonuses bonus-key 
+            (merge bonus-data { claimed: true })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-pool-status)
+    {
+        enabled: (var-get matching-pool-enabled),
+        total: (var-get matching-pool-total),
+        distribution-complete: (var-get pool-distribution-complete),
+        current-round: (var-get game-round)
+    }
+)
+
+(define-read-only (get-pool-contribution (participant principal) (round uint))
+    (map-get? pool-contributions { participant: participant, round: round })
+)
+
+(define-read-only (get-pool-bonus (participant principal) (round uint))
+    (map-get? pool-bonuses { participant: participant, round: round })
 )

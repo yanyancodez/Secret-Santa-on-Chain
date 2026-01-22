@@ -20,6 +20,13 @@
 (define-constant ERR_POOL_DISTRIBUTION_NOT_READY (err u119))
 (define-constant ERR_ALREADY_CLAIMED_BONUS (err u120))
 (define-constant ERR_NO_BONUS_AVAILABLE (err u121))
+(define-constant ERR_STREAK_ALREADY_CLAIMED (err u122))
+(define-constant STREAK_MILESTONE_BRONZE u3)
+(define-constant STREAK_MILESTONE_SILVER u5)
+(define-constant STREAK_MILESTONE_GOLD u10)
+(define-constant STREAK_BONUS_BRONZE u100000)
+(define-constant STREAK_BONUS_SILVER u250000)
+(define-constant STREAK_BONUS_GOLD u500000)
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var game-active bool false)
@@ -113,6 +120,15 @@
     claimed: bool,
     earned-at: uint
 })
+
+(define-map gift-streaks principal {
+    current-streak: uint,
+    longest-streak: uint,
+    last-successful-round: uint,
+    streak-started-round: uint
+})
+
+(define-map streak-rewards-claimed { participant: principal, milestone: uint } bool)
 
 (define-public (initialize-game (reg-deadline uint) (reveal-deadline-param uint) (min-amount uint))
     (begin
@@ -806,4 +822,119 @@
 
 (define-read-only (get-pool-bonus (participant principal) (round uint))
     (map-get? pool-bonuses { participant: participant, round: round })
+)
+
+(define-public (update-gift-streak (participant principal))
+    (let 
+        (
+            (current-round (var-get game-round))
+            (participant-data (unwrap! (map-get? participants participant) ERR_NOT_REGISTERED))
+            (current-streak-data (default-to 
+                {
+                    current-streak: u0,
+                    longest-streak: u0,
+                    last-successful-round: u0,
+                    streak-started-round: u0
+                }
+                (map-get? gift-streaks participant)))
+            (last-round (get last-successful-round current-streak-data))
+            (is-consecutive (or (is-eq last-round u0) (is-eq last-round (- current-round u1))))
+        )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_UNAUTHORIZED)
+        (asserts! (get gift-sent participant-data) ERR_GIFT_NOT_REVEALED)
+        (if is-consecutive
+            (let 
+                (
+                    (new-streak (+ (get current-streak current-streak-data) u1))
+                    (new-longest (if (> new-streak (get longest-streak current-streak-data)) new-streak (get longest-streak current-streak-data)))
+                    (started-round (if (is-eq (get current-streak current-streak-data) u0) current-round (get streak-started-round current-streak-data)))
+                )
+                (map-set gift-streaks participant {
+                    current-streak: new-streak,
+                    longest-streak: new-longest,
+                    last-successful-round: current-round,
+                    streak-started-round: started-round
+                })
+                (ok new-streak)
+            )
+            (begin
+                (map-set gift-streaks participant {
+                    current-streak: u1,
+                    longest-streak: (if (> u1 (get longest-streak current-streak-data)) u1 (get longest-streak current-streak-data)),
+                    last-successful-round: current-round,
+                    streak-started-round: current-round
+                })
+                (ok u1)
+            )
+        )
+    )
+)
+
+(define-public (claim-streak-reward (milestone uint))
+    (let 
+        (
+            (claimer tx-sender)
+            (streak-data (unwrap! (map-get? gift-streaks claimer) ERR_NOT_REGISTERED))
+            (current-streak (get current-streak streak-data))
+            (reward-key { participant: claimer, milestone: milestone })
+            (already-claimed (default-to false (map-get? streak-rewards-claimed reward-key)))
+            (bonus-amount (if (is-eq milestone STREAK_MILESTONE_GOLD) 
+                STREAK_BONUS_GOLD 
+                (if (is-eq milestone STREAK_MILESTONE_SILVER) 
+                    STREAK_BONUS_SILVER 
+                    STREAK_BONUS_BRONZE)))
+        )
+        (asserts! (not already-claimed) ERR_STREAK_ALREADY_CLAIMED)
+        (asserts! (or (is-eq milestone STREAK_MILESTONE_BRONZE) (or (is-eq milestone STREAK_MILESTONE_SILVER) (is-eq milestone STREAK_MILESTONE_GOLD))) ERR_UNAUTHORIZED)
+        (asserts! (>= current-streak milestone) ERR_NO_BONUS_AVAILABLE)
+        (try! (as-contract (stx-transfer? bonus-amount tx-sender claimer)))
+        (map-set streak-rewards-claimed reward-key true)
+        (ok bonus-amount)
+    )
+)
+
+(define-read-only (get-gift-streak (participant principal))
+    (default-to 
+        {
+            current-streak: u0,
+            longest-streak: u0,
+            last-successful-round: u0,
+            streak-started-round: u0
+        }
+        (map-get? gift-streaks participant)
+    )
+)
+
+(define-read-only (get-streak-milestone-status (participant principal))
+    (let 
+        (
+            (streak-data (get-gift-streak participant))
+            (current-streak (get current-streak streak-data))
+        )
+        {
+            current-streak: current-streak,
+            bronze-eligible: (>= current-streak STREAK_MILESTONE_BRONZE),
+            silver-eligible: (>= current-streak STREAK_MILESTONE_SILVER),
+            gold-eligible: (>= current-streak STREAK_MILESTONE_GOLD),
+            bronze-claimed: (default-to false (map-get? streak-rewards-claimed { participant: participant, milestone: STREAK_MILESTONE_BRONZE })),
+            silver-claimed: (default-to false (map-get? streak-rewards-claimed { participant: participant, milestone: STREAK_MILESTONE_SILVER })),
+            gold-claimed: (default-to false (map-get? streak-rewards-claimed { participant: participant, milestone: STREAK_MILESTONE_GOLD }))
+        }
+    )
+)
+
+(define-read-only (get-streak-leaderboard-entry (participant principal))
+    (let 
+        (
+            (streak-data (get-gift-streak participant))
+            (reputation (get-participant-reputation participant))
+        )
+        {
+            participant: participant,
+            current-streak: (get current-streak streak-data),
+            longest-streak: (get longest-streak streak-data),
+            games-participated: (get games-participated reputation),
+            average-rating: (get average-rating reputation)
+        }
+    )
 )
